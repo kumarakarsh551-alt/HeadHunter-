@@ -1,6 +1,17 @@
-name: Build Forge Mod
+name: Compile Minecraft Mod JAR
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      source_zip_path:
+        description: 'Path to source zip inside repo (leave blank if source files are already extracted)'
+        required: false
+        default: ''
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -10,26 +21,73 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Unpack source zip (if provided)
+        if: ${{ inputs.source_zip_path != '' }}
+        run: |
+          unzip -o "${{ inputs.source_zip_path }}" -d .
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
-          java-version: '17'
           distribution: 'temurin'
+          java-version: '17'
 
-      - name: Setup Gradle
+      - name: Download 1.19.2 Mojang client mappings & MCPConfig joined.tsrg
+        run: |
+          mkdir -p build-inputs
+          cd build-inputs
+
+          # Fetch 1.19.2 version manifest and client mappings URL
+          VERSION_MANIFEST_URL=$(curl -s https://piston-meta.mojang.com/mc/game/version_manifest_v2.json | python3 -c "import sys, json; data=json.load(sys.stdin); print(next(v['url'] for v in data['versions'] if v['id']=='1.19.2'))")
+          CLIENT_MAPPINGS_URL=$(curl -s "$VERSION_MANIFEST_URL" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['downloads']['client_mappings']['url'])")
+          curl -fSL "$CLIENT_MAPPINGS_URL" -o client.txt
+
+          # Download MCPConfig 1.19.2 and extract config/joined.tsrg
+          curl -fSL "https://maven.minecraftforge.net/de/oceanlabs/mcp/mcp_config/1.19.2-20220805.130853/mcp_config-1.19.2-20220805.130853.zip" -o mcp_config.zip
+          unzip -jo mcp_config.zip "config/joined.tsrg" -d .
+
+      - name: Run port pipeline (SRG -> Mojang + 1.20 migration)
+        run: |
+          chmod +x tools/port.sh || chmod +x port.sh || true
+          if [ -x tools/port.sh ]; then
+            ./tools/port.sh build-inputs/client.txt build-inputs/joined.tsrg
+          elif [ -x port.sh ]; then
+            ./port.sh build-inputs/client.txt build-inputs/joined.tsrg
+          else
+            echo "port.sh not found; checking scripts in root/tools"
+            ls -la . tools || true
+            exit 1
+          fi
+
+      - name: Inspect migration reports
+        run: |
+          echo "=== unmapped_ids.txt ==="
+          cat unmapped_ids.txt 2>/dev/null || true
+          echo "=== MIGRATION_TODO.txt (first 80 lines) ==="
+          head -n 80 MIGRATION_TODO.txt 2>/dev/null || true
+
+      - name: Setup Gradle & Build JAR
         uses: gradle/actions/setup-gradle@v5
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
-        # working-directory: ./YourSubfolderName  <-- Uncomment if gradlew is in a subfolder
+      - name: Compile with Gradle
+        run: |
+          chmod +x gradlew
+          ./gradlew build --stacktrace
 
-      - name: Build with Gradle
-        run: ./gradlew build
-        # working-directory: ./YourSubfolderName  <-- Uncomment if gradlew is in a subfolder
-
-      - name: Upload built JAR
-        uses: actions/upload-artifact@v4
+      - name: Upload compiled JAR and migration logs
+        if: always()
+        uses: actions/upload-artifact@v5
         with:
-          name: mod-jar
-          path: build/libs/*.jar
+          name: headhunter-1.20.1-build
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+            unmapped_ids.txt
+            MIGRATION_TODO.txt
+          if-no-files-found: warn
           
