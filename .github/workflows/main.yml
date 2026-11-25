@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_zip_path:
-        description: 'Path to source zip inside repo (leave blank if source files are already extracted)'
+        description: 'Optional path to source zip inside repo'
         required: false
         default: ''
   push:
@@ -19,75 +19,79 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Unpack source zip (if provided)
         if: ${{ inputs.source_zip_path != '' }}
         run: |
           unzip -o "${{ inputs.source_zip_path }}" -d .
 
-      - name: Set up Python 3
+      - name: Ensure port.sh, srg2mojmap.py, and api_migrate_1_20.py exist
+        run: |
+          for f in port.sh srg2mojmap.py api_migrate_1_20.py; do
+            if [ ! -f "$f" ] && [ ! -f "tools/$f" ]; then
+              echo "Fetching $f from repository raw main..."
+              curl -fsSL "https://raw.githubusercontent.com/kumarakarsh551-alt/HeadHunter-/main/$f" -o "$f" || true
+            fi
+          done
+
+          if [ -f "port.sh" ]; then
+            SCRIPT_DIR="$(pwd)"
+          elif [ -f "tools/port.sh" ]; then
+            SCRIPT_DIR="$(pwd)/tools"
+          else
+            echo "ERROR: port.sh still missing. Workspace files:"
+            find . -maxdepth 3 -not -path '*/.*'
+            exit 1
+          fi
+
+          echo "SCRIPT_DIR=$SCRIPT_DIR" >> "$GITHUB_ENV"
+          ls -la "$SCRIPT_DIR"
+
+      - name: Set up Python 3 and JDK 17
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v5
+      - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Download 1.19.2 Mojang client mappings & MCPConfig joined.tsrg
+      - name: Download 1.19.2 mappings and MCPConfig joined.tsrg
         run: |
-          mkdir -p build-inputs
-          cd build-inputs
+          mkdir -p "$(pwd)/build-inputs"
+          cd "$(pwd)/build-inputs"
 
-          # Fetch 1.19.2 version manifest and client mappings URL
           VERSION_MANIFEST_URL=$(curl -s https://piston-meta.mojang.com/mc/game/version_manifest_v2.json | python3 -c "import sys, json; data=json.load(sys.stdin); print(next(v['url'] for v in data['versions'] if v['id']=='1.19.2'))")
           CLIENT_MAPPINGS_URL=$(curl -s "$VERSION_MANIFEST_URL" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['downloads']['client_mappings']['url'])")
           curl -fSL "$CLIENT_MAPPINGS_URL" -o client.txt
 
-          # Download MCPConfig 1.19.2 and extract config/joined.tsrg
           curl -fSL "https://maven.minecraftforge.net/de/oceanlabs/mcp/mcp_config/1.19.2-20220805.130853/mcp_config-1.19.2-20220805.130853.zip" -o mcp_config.zip
           unzip -jo mcp_config.zip "config/joined.tsrg" -d .
 
-      - name: Run port pipeline (SRG -> Mojang + 1.20 migration)
+      - name: Run SRG-to-Mojang and 1.20 migration pipeline
         run: |
-          chmod +x tools/port.sh || chmod +x port.sh || true
-          if [ -x tools/port.sh ]; then
-            ./tools/port.sh build-inputs/client.txt build-inputs/joined.tsrg
-          elif [ -x port.sh ]; then
-            ./port.sh build-inputs/client.txt build-inputs/joined.tsrg
-          else
-            echo "port.sh not found; checking scripts in root/tools"
-            ls -la . tools || true
-            exit 1
-          fi
+          chmod +x "$SCRIPT_DIR/port.sh"
+          (
+            cd "$SCRIPT_DIR"
+            ./port.sh "$(pwd)/../../build-inputs/client.txt" "$(pwd)/../../build-inputs/joined.tsrg" || \
+            ./port.sh "$GITHUB_WORKSPACE/build-inputs/client.txt" "$GITHUB_WORKSPACE/build-inputs/joined.tsrg"
+          )
 
-      - name: Inspect migration reports
-        run: |
-          echo "=== unmapped_ids.txt ==="
-          cat unmapped_ids.txt 2>/dev/null || true
-          echo "=== MIGRATION_TODO.txt (first 80 lines) ==="
-          head -n 80 MIGRATION_TODO.txt 2>/dev/null || true
-
-      - name: Setup Gradle & Build JAR
-        uses: gradle/actions/setup-gradle@v5
-
-      - name: Compile with Gradle
+      - name: Build Minecraft JAR with Gradle
         run: |
           chmod +x gradlew
           ./gradlew build --stacktrace
 
-      - name: Upload compiled JAR and migration logs
+      - name: Upload JAR and migration logs
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: headhunter-1.20.1-build
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar
-            unmapped_ids.txt
-            MIGRATION_TODO.txt
+            **/unmapped_ids.txt
+            **/MIGRATION_TODO.txt
           if-no-files-found: warn
           
